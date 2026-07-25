@@ -1,0 +1,31 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://example.invalid/schemas/parcel.schema.json",
+  "title": "Parcel",
+  "type": "object",
+  "required": ["parcelId", "weightKg"],
+  "properties": {
+    "parcelId": { "type": "string", "format": "uuid" },
+    "weightKg": { "type": "number", "minimum": 0.01 },
+    "destination": { "$ref": "#/$defs/address" },
+    "tariff": { "$ref": "#/$defs/tariff" }
+  },
+  "$defs": {
+    "address": {
+      "type": "object",
+      "properties": {
+        "street": { "type": "string" },
+        "postalCode": { "type": "string" },
+        "countryCode": { "type": "string", "minLength": 2, "maxLength": 2 }
+      }
+    },
+    "tariff": {
+      "type": "object",
+      "properties": {
+        "currency": { "type": "string" },
+        "baseAmount": { "type": "string" },
+        "perKilogram": { "type": "string" }
+      }
+    }
+  }
+}
