@@ -12,6 +12,9 @@ Markdown (produce `Variable` / `Section` nodes that appear to get none).
 `.cbmignore` excludes this README, because its prose contains the query terms
 and would otherwise contaminate the corpus under test.
 
+Every number below was re-verified from a clean `git clone` into an unrelated
+directory, after `delete_project`.
+
 ## Reproduce
 
 ```bash
@@ -22,8 +25,6 @@ codebase-memory-mcp cli search_graph --project repro --semantic-query '["discoun
 ```
 
 ## Finding 1 — language builtins outrank all project code
-
-Reproduced under every index configuration tried.
 
 `["discount tariff currency"]` returns **no pricing code at all**:
 
@@ -46,27 +47,75 @@ Dijkstra implementation and the only correct answer. It is not returned.
 **Expected:** builtin/stub nodes excluded from semantic ranking; project symbols
 ranked by topical similarity.
 
-## Finding 2 — negative cosine similarities are returned as top hits
+## Finding 2 — negative cosine similarities returned as top hits
 
 `["battery temperature sensor"]`:
 
 | symbol | file | score |
 | --- | --- | --- |
-| `invoice_total` | `src/pricing.py` | **-0.009** |
-| `print` | `<python-builtins>` | **-0.012** |
-| `append` | `<python-builtins>` | **-0.012** |
+| `invoice_total` | `src/pricing.py` | **-0.008916** |
+| `print` | `<python-builtins>` | **-0.011670** |
+| `append` | `<python-builtins>` | **-0.011673** |
 
-A per-keyword min-cosine gate — which `--help` describes — should not surface
-negative similarities at all, and the whole observed score range across queries
-is roughly -0.02 … 0.23. That band looks low for exact-topic matches and may
-indicate a normalization problem independent of Finding 1.
+`--help` describes a per-keyword min-cosine gate, which should not surface
+negative similarities at all. The observed range across all queries is roughly
+-0.015 … 0.229 — low for exact-topic matches, suggesting a normalization problem
+independent of Finding 1.
 
-## Finding 3 — `results` ignores `semantic_query`
+## Finding 3 — scores depend on the project name
+
+Same clone, same commit, byte-identical source; only `--name` differs:
+
+```bash
+codebase-memory-mcp cli index_repository --repo-path "$PWD" --name repro     --mode full
+codebase-memory-mcp cli index_repository --repo-path "$PWD" --name othername --mode full
+codebase-memory-mcp cli search_graph --project repro     --semantic-query '["battery temperature sensor"]' --limit 4
+codebase-memory-mcp cli search_graph --project othername --semantic-query '["battery temperature sensor"]' --limit 4
+```
+
+| rank | `--name repro` | `--name othername` |
+| --- | --- | --- |
+| 1 | `invoice_total` -0.00891594 | `split_into_legs` -0.00888523 |
+| 2 | `print` -0.01167019 | `print` -0.01166980 |
+| 3 | `append` -0.01167298 | `append` -0.01167576 |
+| 4 | `pop` -0.01464620 | `invoice_total` -0.01185947 |
+
+`invoice_total` moves from rank 1 to rank 4 and its score changes by ~33%. The
+project name prefixes every `qualified_name`, so this is consistent with vectors
+derived from identifier text rather than a pretrained code embedding — but that
+is a hypothesis, not a diagnosis. The reproducible fact is that **an arbitrary
+project label changes semantic similarity between code symbols.**
+
+## Finding 4 — `.cbmignore` is not re-evaluated on re-index
+
+Separate bug, found while building this repro. Replayable from a clean clone:
+
+```bash
+# docs/decisions.md starts indexed
+codebase-memory-mcp cli search_graph --project repro --name-pattern '.*' --file-pattern 'docs/decisions%'
+# -> total: 6
+
+printf 'README.md\ndocs/decisions.md\n' > .cbmignore
+codebase-memory-mcp cli index_repository --repo-path "$PWD" --name repro --mode full   # -> nodes: 84
+codebase-memory-mcp cli search_graph --project repro --name-pattern '.*' --file-pattern 'docs/decisions%'
+# -> total: 6    (still indexed; the new ignore rule had no effect)
+
+codebase-memory-mcp cli delete_project --project repro
+codebase-memory-mcp cli index_repository --repo-path "$PWD" --name repro --mode full   # -> nodes: 78
+codebase-memory-mcp cli search_graph --project repro --name-pattern '.*' --file-pattern 'docs/decisions%'
+# -> total: 0    (correct)
+```
+
+`delete_project` first is currently required for any ignore-rule change to apply.
+
+## Finding 5 — `results` ignores `semantic_query`
 
 This is what #915 reports. It may be intended.
 
 With `semantic_query` as the only argument, `results` is byte-for-byte identical
-for every query, alphabetical by `name`, `total` equal to the full node count:
+for every query, alphabetical by `name`, `total` equal to the full node count.
+Verified by hashing the rows from three unrelated queries — all three hash the
+same:
 
 ```json
 {
@@ -98,27 +147,6 @@ level=info msg=vector_search.done candidates=15
 {"total":84,"results":[ ... 84 nodes, alphabetical ... ]}
 ```
 
-## Finding 4 — `.cbmignore` is not re-evaluated on re-index
-
-Separate bug, found while building this repro.
-
-Adding a pattern to `.cbmignore` and re-running `index_repository` against an
-**existing** project leaves the newly-ignored files in the graph:
-
-```bash
-echo 'README.md' > .cbmignore
-codebase-memory-mcp cli index_repository --repo-path "$PWD" --name repro --mode full
-codebase-memory-mcp cli search_graph --project repro --name-pattern '.*' --file-pattern 'README%'
-# -> total: 12   (README nodes still indexed)
-
-codebase-memory-mcp cli delete_project --project repro
-codebase-memory-mcp cli index_repository --repo-path "$PWD" --name repro --mode full
-codebase-memory-mcp cli search_graph --project repro --name-pattern '.*' --file-pattern 'README%'
-# -> total: 0    (correct)
-```
-
-`delete_project` first is currently required for ignore-rule changes to apply.
-
 ## Control — the index is sound
 
 ```bash
@@ -140,16 +168,17 @@ codebase-memory-mcp cli search_graph --project repro --query "discount tariff cu
 BM25 is exactly right, and `name_pattern` is unaffected. The defect is confined
 to `semantic_query`.
 
-## Stability, honestly
+## Determinism
 
-- **Deterministic for a built index.** Same query, 3 consecutive runs → identical
+- **Stable for a given index.** Same query, 3 consecutive runs → identical
   scores. Re-indexing unchanged content → identical scores.
-- **Not stable across rebuilds.** Scores and ordering shifted when the corpus
-  changed and again when only the `--name` changed (the project name prefixes
-  every `qualified_name`). One early build did rank the telemetry query
-  correctly; later builds of equivalent content did not, and I could not isolate
-  which variable is responsible. Reported as an observation, not a diagnosis.
-- Findings 1–4 held under every configuration tried.
+- **Path-independent.** A clean clone into an unrelated directory reproduces
+  every score above to the digit.
+- **Not stable across index identity.** See Finding 3.
+- One early build did rank `["battery temperature sensor"]` correctly
+  (`refrigeration_breached` 0.068, `battery_is_critical` 0.065). Later builds of
+  equivalent content did not, and I could not isolate the variable. Recorded as
+  an unexplained observation.
 
 ## Not reproduced here
 
