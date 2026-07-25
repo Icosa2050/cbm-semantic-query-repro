@@ -15,7 +15,7 @@ and would otherwise contaminate the corpus under test.
 ## Reproduce
 
 ```bash
-git clone https://github.com/<owner>/cbm-semantic-query-repro
+git clone https://github.com/Icosa2050/cbm-semantic-query-repro
 cd cbm-semantic-query-repro
 codebase-memory-mcp cli index_repository --repo-path "$PWD" --name repro --mode full
 codebase-memory-mcp cli search_graph --project repro --semantic-query '["discount tariff currency"]' --limit 5
