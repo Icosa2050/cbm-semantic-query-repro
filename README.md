@@ -1,15 +1,14 @@
-# Minimal reproduction — `semantic_query` ranking is dominated by language builtins
+# Minimal reproduction — `semantic_query` rankings are corpus-fitted, not semantic
 
 Context for [DeusData/codebase-memory-mcp#915](https://github.com/DeusData/codebase-memory-mcp/issues/915),
 on **v0.9.0** (the issue was filed against v0.8.1).
 
-This repository is synthetic throwaway code: a parcel delivery service with
-three deliberately unrelated domains — pricing, telemetry, routing — so every
-query below has one obviously correct answer.
+Synthetic throwaway code: a parcel delivery service with three deliberately
+unrelated domains — pricing, telemetry, routing — so every query below has one
+obviously correct answer. **93 nodes**; none of this needs a large graph.
 
-- **84 nodes.** Neither finding needs a large graph.
-- Three file kinds on purpose: Python (gets vectors), plus JSON Schema and
-  Markdown (produce `Variable` / `Section` nodes that appear to get none).
+Three file kinds on purpose: Python (gets vectors), plus JSON Schema and
+Markdown (produce `Variable` / `Section` nodes that appear to get none).
 
 ## Reproduce
 
@@ -17,58 +16,82 @@ query below has one obviously correct answer.
 git clone https://github.com/<owner>/cbm-semantic-query-repro
 cd cbm-semantic-query-repro
 codebase-memory-mcp cli index_repository --repo-path "$PWD" --name repro --mode full
-codebase-memory-mcp cli search_graph --project repro --semantic-query '["battery temperature sensor"]' --limit 5
-codebase-memory-mcp cli search_graph --project repro --semantic-query '["discount tariff currency"]'   --limit 5
+codebase-memory-mcp cli search_graph --project repro --semantic-query '["waypoint graph shortest path"]' --limit 5
 ```
 
-## Finding 1 — builtins are embedded and outrank project code
+## Finding 1 — ranking inverts when one unrelated file is added
 
-This is in `semantic_results`, which per `cli search_graph --help` is the
-documented destination for `semantic_query` output.
+The headline. Ranking is **deterministic for a given index** but **unstable
+across re-indexes of near-identical content**, and the shift is not a small
+reordering — it inverts.
 
-`["battery temperature sensor"]` is correct:
+Indexing the three source files alone gives **84 nodes** and a correct answer
+for the telemetry query:
 
-| symbol | file | score |
+| query | top 3 | verdict |
 | --- | --- | --- |
-| `refrigeration_breached` | `src/telemetry.py` | 0.068 |
-| `battery_is_critical` | `src/telemetry.py` | 0.065 |
-| `summarize_sensor_alarms` | `src/telemetry.py` | 0.062 |
+| `["battery temperature sensor"]` | `refrigeration_breached` 0.068, `battery_is_critical` 0.065, `summarize_sensor_alarms` 0.062 | correct |
 
-`["discount tariff currency"]` returns **no pricing code at all** — five Python
-builtins, each scoring higher than the best correct hit above:
+Adding this README — one Markdown file, no code — gives **93 nodes**, and the
+same query collapses:
 
-| symbol | file | score |
+| query | top 3 | verdict |
 | --- | --- | --- |
-| `print` | `<python-builtins>` | 0.123 |
-| `append` | `<python-builtins>` | 0.114 |
-| `pop` | `<python-builtins>` | 0.108 |
-| `upper` | `<python-builtins>` | 0.100 |
-| `lower` | `<python-builtins>` | 0.097 |
+| `["battery temperature sensor"]` | `invoice_total` **-0.009**, `print` **-0.012**, `append` **-0.012** | wrong domain, all scores negative |
+| `["waypoint graph shortest path"]` | `tyre_pressure_low` 0.229, `battery_is_critical` 0.220, `summarize_sensor_alarms` 0.217 | telemetry wins a routing query; `shortest_route` absent |
+
+`src/routing.py` defines `shortest_route`, a Dijkstra implementation — the only
+correct answer to that third query. It is not returned at any limit.
+
+### It is not random seeding
+
+- Same index, same query, 3 consecutive runs → byte-identical scores.
+- Re-indexing **unchanged** content twice → byte-identical scores.
+- Adding one Markdown file → completely different ordering and sign.
+
+So the vectors appear to be **fitted to the corpus** (TF-IDF / hashing /
+SVD-like) rather than produced by a pretrained embedding model. That single
+hypothesis explains everything observed here:
+
+- cosine scores confined to roughly -0.02 … 0.23, where exact-topic matches
+  should be far higher;
+- **negative** similarities surfacing as top-ranked results;
+- corpus sensitivity — the space is refit when documents change;
+- no vocabulary bridging (in a separate private test, a German query never
+  reached the equivalent English identifiers).
+
+## Finding 2 — language builtins are embedded and outrank project code
+
+`["discount tariff currency"]` returns **no pricing code at all**, on both the
+84-node and 93-node indexes:
+
+| symbol | file | score (93-node) |
+| --- | --- | --- |
+| `print` | `<python-builtins>` | 0.093 |
+| `pop` | `<python-builtins>` | 0.079 |
+| `append` | `<python-builtins>` | 0.079 |
+| `upper` | `<python-builtins>` | 0.071 |
+| `lower` | `<python-builtins>` | 0.068 |
 
 `src/pricing.py` defines `compute_bulk_discount`, `apply_currency_surcharge`,
-`invoice_total` and a `Tariff` dataclass. None are returned.
+`invoice_total` and a `Tariff` dataclass. None appear.
 
-`["waypoint graph shortest path"]` likewise misses `shortest_route` — the
-Dijkstra implementation, and the only correct answer — while returning
-`builtins.len`.
+Interpreter builtins are generic high-frequency tokens, so under a corpus-fitted
+scheme they would naturally accumulate undifferentiated weight — consistent with
+Finding 1.
 
-Scores stay in a 0.01–0.12 band throughout, which looks low for exact-topic
-matches and may indicate a normalization issue alongside the stub pollution.
+**Expected:** stub/builtin nodes excluded from semantic ranking.
 
-**Expected:** builtin/stub nodes excluded from semantic ranking, or scored in
-the same normalized space as project symbols.
-
-## Finding 2 — `results` is unranked and identical across queries
+## Finding 3 — `results` ignores `semantic_query` entirely
 
 Possibly working as intended; recorded because it is what #915 reports.
 
-When `semantic_query` is the only argument, `results` comes back byte-for-byte
-identical for every query, alphabetical by `name`, with `total` equal to the
-full node count:
+With `semantic_query` as the only argument, `results` is byte-for-byte identical
+for every query, alphabetical by `name`, `total` equal to the full node count:
 
 ```json
 {
-  "total": 84,
+  "total": 93,
   "results": [
     { "name": "\"Deferred Until\" Conditions", "label": "Section",  "file_path": "docs/decisions.md" },
     { "name": "$defs",                          "label": "Variable", "file_path": "schemas/parcel.schema.json" },
@@ -80,33 +103,22 @@ full node count:
 }
 ```
 
-Three unrelated queries — `["battery temperature sensor"]`,
-`["discount tariff currency"]`, `["waypoint graph shortest path"]` — produce
-exactly these five rows.
+Per `cli search_graph --help`, semantic output is documented to land in
+`semantic_results`, and with no `query` / `name_pattern` / `label` supplied there
+is nothing to filter `results` by — so this may be by design, and #915's
+`LEFT JOIN node_vectors` diagnosis may be aimed at the wrong field.
 
-Reading `--help`, this may be correct: semantic output is documented to land in
-`semantic_results`, and with no `query` / `name_pattern` / `label` supplied
-there is nothing to filter `results` by, so it degenerates to "every node,
-alphabetical." If so, #915's diagnosis (`LEFT JOIN node_vectors` with NULLs
-sorting first) may be aimed at the wrong field.
-
-Either way the API is easy to misread: `total: 84` alongside a populated
-`results` array reads as "84 matches," and every visible row is a node that
-should have no vector. Worth either filtering `results` when `semantic_query`
-is the sole argument, or documenting the split more loudly.
-
-Verbose CLI logging shows the vector search does run and produce candidates,
-which are then absent from `results`:
+It still misleads: `total: 93` beside a populated `results` array reads as
+"93 matches," and every visible row is a node that should have no vector.
+Verbose logs show the vector search runs and its candidates are then absent:
 
 ```
 level=info msg=vector_search.exec kw_count=1 fetch_limit=15 project=repro
 level=info msg=vector_search.done candidates=15
-{"total":84,"results":[ ... 84 nodes, alphabetical ... ]}
+{"total":93,"results":[ ... 93 nodes, alphabetical ... ]}
 ```
 
 ## Control — the index is sound
-
-BM25 over the same phrase is exactly right:
 
 ```bash
 codebase-memory-mcp cli search_graph --project repro --query "discount tariff currency" --limit 5
@@ -124,16 +136,21 @@ codebase-memory-mcp cli search_graph --project repro --query "discount tariff cu
 }
 ```
 
-`name_pattern` is likewise unaffected. Only `semantic_query` misbehaves.
+BM25 is exactly right, and `name_pattern` is unaffected. The defect is confined
+to `semantic_query`.
+
+## Reproducing the 84-node baseline
+
+`git rm README.md` (or index a checkout of the first commit) and re-index. The
+telemetry query becomes correct again. That transition is Finding 1.
 
 ## Not reproduced here
 
 On a larger private graph (~44k nodes) the same path returned rows whose `name`
-did not correspond to their own `qualified_name` / `file_path` — e.g.
-`name: "$defs"` carrying `qualified_name: ...ValidationChangeType.removed`.
-That does **not** occur in this 84-node repro, where every `name` matches its
-`qualified_name`. Recorded only in case it shares a root cause; it needs its
-own reproduction.
+did not match their own `qualified_name` / `file_path` — e.g. `name: "$defs"`
+carrying `qualified_name: ...ValidationChangeType.removed`. That does **not**
+occur in this 93-node repro, where every `name` matches. Recorded in case it
+shares a root cause; it needs its own reproduction.
 
 ## Environment
 
