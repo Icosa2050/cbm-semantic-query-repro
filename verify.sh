@@ -31,6 +31,18 @@ echo
 
 idx repro
 
+# --- Guard: the harness must not be part of the corpus ----------------------
+# README.md and verify.sh both name the query terms. If either gets indexed the
+# scores shift and every table below goes stale, which has happened twice.
+echo "Guard — harness excluded from corpus"
+selfnodes=$(q --project repro --name-pattern '.*' --file-pattern 'README%' \
+  | python3 -c 'import sys,json; print(json.load(sys.stdin)["total"])')
+vnodes=$(q --project repro --name-pattern '.*' --file-pattern 'verify%' \
+  | python3 -c 'import sys,json; print(json.load(sys.stdin)["total"])')
+[ "${selfnodes:-1}" = "0" ] && [ "${vnodes:-1}" = "0" ] \
+  && ok "README.md and verify.sh are not indexed" \
+  || bad "harness leaked into corpus (README=$selfnodes verify=$vnodes); scores below are unreliable"
+
 # --- Finding 1: builtins outrank project code -------------------------------
 echo "Finding 1 — builtins outrank project code"
 out=$(q --project repro --semantic-query '["discount tariff currency"]' --limit 5)
@@ -65,11 +77,11 @@ b=$(q --project othername --semantic-query '["battery temperature sensor"]' --li
   || bad "rank-1 identical ('$a'); not reproduced here"
 
 # --- Finding 4: .cbmignore not re-evaluated on re-index ---------------------
-echo "Finding 4 — .cbmignore ignored on re-index of existing project"
+echo "Finding 4 — re-index applies inclusions but not exclusions"
 before=$(q --project repro --name-pattern '.*' --file-pattern 'docs/decisions%' \
           | python3 -c 'import sys,json; print(json.load(sys.stdin)["total"])')
 cp "$REPO/.cbmignore" "$CACHE/cbmignore.bak"
-printf 'README.md\ndocs/decisions.md\n' > "$REPO/.cbmignore"
+printf 'README.md\nverify.sh\ndocs/decisions.md\n' > "$REPO/.cbmignore"
 idx repro
 during=$(q --project repro --name-pattern '.*' --file-pattern 'docs/decisions%' \
           | python3 -c 'import sys,json; print(json.load(sys.stdin)["total"])')

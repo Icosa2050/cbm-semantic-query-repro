@@ -116,17 +116,19 @@ derived from identifier text rather than a pretrained code embedding — but tha
 is a hypothesis, not a diagnosis. The reproducible fact is that **an arbitrary
 project label changes semantic similarity between code symbols.**
 
-## Finding 4 — `.cbmignore` is not re-evaluated on re-index
+## Finding 4 — re-index applies `.cbmignore` inclusions but not exclusions
 
-Separate bug, found while building this repro. Replayable from a clean clone:
+Separate bug, found while building this repro. Replayable from a clean clone.
+Note the ignore file must keep `README.md` and `verify.sh` listed, or you are
+changing two variables at once.
 
 ```bash
 # docs/decisions.md starts indexed
 codebase-memory-mcp cli search_graph --project repro --name-pattern '.*' --file-pattern 'docs/decisions%'
 # -> total: 6
 
-printf 'README.md\ndocs/decisions.md\n' > .cbmignore
-codebase-memory-mcp cli index_repository --repo-path "$PWD" --name repro --mode full   # -> nodes: 84
+printf 'README.md\nverify.sh\ndocs/decisions.md\n' > .cbmignore
+codebase-memory-mcp cli index_repository --repo-path "$PWD" --name repro --mode full   # -> nodes: 84 (unchanged)
 codebase-memory-mcp cli search_graph --project repro --name-pattern '.*' --file-pattern 'docs/decisions%'
 # -> total: 6    (still indexed; the new ignore rule had no effect)
 
@@ -136,7 +138,13 @@ codebase-memory-mcp cli search_graph --project repro --name-pattern '.*' --file-
 # -> total: 0    (correct)
 ```
 
-`delete_project` first is currently required for any ignore-rule change to apply.
+The update is **additive-only**. Dropping a name from `.cbmignore` so a file
+becomes newly *eligible* is picked up by a plain re-index; adding a name so a
+file becomes newly *ignored* is not. Removing `verify.sh` from the ignore list
+and re-indexing takes the graph 84 -> 101 (its 17 nodes are added immediately),
+while `docs/decisions.md` stays indexed in the same run.
+
+`delete_project` first is currently required for any exclusion to take effect.
 
 ## Finding 5 — `results` ignores `semantic_query`
 
