@@ -9,21 +9,29 @@ obviously correct answer. **84 indexed nodes**; none of this needs a large graph
 
 Three file kinds on purpose: Python (gets vectors), plus JSON Schema and
 Markdown (produce `Variable` / `Section` nodes that appear to get none).
-`.cbmignore` excludes this README, because its prose contains the query terms
-and would otherwise contaminate the corpus under test.
+`.cbmignore` excludes `README.md` and `verify.sh`: both mention the query terms,
+and both would otherwise contaminate the corpus under test. Adding `verify.sh`
+to the corpus moves every score — see Finding 3.
 
-Every number below was re-verified from a clean `git clone` into an unrelated
-directory, after `delete_project`, and again with a virgin `CBM_CACHE_DIR` —
-identical to the digit each time, so nothing here depends on prior local state.
+### Verification performed
 
-### What is being claimed, and how strongly
+| | |
+| --- | --- |
+| Clean `git clone` into unrelated directories | identical |
+| Virgin `CBM_CACHE_DIR` | identical |
+| **macOS 15 / arm64** vs **Linux 7.0 / x86_64**, both v0.9.0 | **identical to 8 decimals** |
 
-The **claims are the orderings**, not the decimals: builtins ranking above
-project code, negative similarities appearing at all, and rank changing with the
-project name. Exact scores are quoted so you can tell whether you are seeing the
-same state, but they were only produced on **macOS 15 / arm64 / v0.9.0**. If your
-digits differ but `<python-builtins>` still outranks `src/pricing.py`, that is
-the bug, not a failed reproduction.
+Nothing here depends on prior local state, on the checkout path, or on the
+platform. `verify.sh` returned 6/6 on both machines with the same `results`
+hash.
+
+### What is being claimed
+
+The **claims are the orderings** — builtins ranking above project code, negative
+similarities appearing at all, rank changing with the project name. Exact scores
+are quoted because they proved stable across both platforms tested, so a
+mismatch is informative. But if your digits differ and `<python-builtins>` still
+outranks `src/pricing.py`, that is still the bug.
 
 Two scope limits worth knowing before you spend time:
 
@@ -213,7 +221,7 @@ root cause; it needs its own reproduction.
 ## Environment
 
 - `codebase-memory-mcp` 0.9.0
-- macOS 15 (Darwin 25.5.0), arm64
+- Verified on macOS 15 (Darwin 25.5.0) arm64 **and** Linux 7.0.0 x86_64 — identical results
 - Index mode: `full`
 
 ## One-command check
