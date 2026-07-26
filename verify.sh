@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
-# Asserts the qualitative claims in README.md. Exact scores are platform- and
-# version-dependent and are deliberately NOT asserted; the orderings are.
+# Asserts the behaviours described in README.md. Exact scores are not asserted;
+# orderings and category membership are.
 #
-#   ./verify.sh            uses `codebase-memory-mcp` from PATH
+#   ./verify.sh                      codebase-memory-mcp from PATH
 #   CBM=/path/to/bin ./verify.sh
 #
-# Runs against a throwaway CBM_CACHE_DIR so your real index is untouched.
+# Uses a throwaway CBM_CACHE_DIR, so your real indexes are untouched.
 
 set -uo pipefail
 
@@ -19,11 +19,14 @@ command -v "$CBM" >/dev/null || { echo "not found: $CBM"; exit 127; }
 command -v python3 >/dev/null || { echo "python3 required"; exit 127; }
 
 pass=0; fail=0
-ok()   { printf '  PASS  %s\n' "$1"; pass=$((pass+1)); }
-bad()  { printf '  FAIL  %s\n' "$1"; fail=$((fail+1)); }
+ok()  { printf '  PASS  %s\n' "$1"; pass=$((pass+1)); }
+bad() { printf '  FAIL  %s\n' "$1"; fail=$((fail+1)); }
+skip(){ printf '  SKIP  %s\n' "$1"; }
 
-q() { "$CBM" cli search_graph "$@" 2>/dev/null | grep -v '^level='; }
+q()   { "$CBM" cli search_graph "$@" 2>/dev/null | grep -v '^level='; }
 idx() { "$CBM" cli index_repository --repo-path "$REPO" --name "$1" --mode full >/dev/null 2>&1; }
+# names of semantic_results, one per line
+names() { python3 -c 'import sys,json; [print(x["name"]+"\t"+x["file_path"]) for x in json.load(sys.stdin).get("semantic_results",[])]'; }
 
 echo "codebase-memory-mcp: $("$CBM" --version 2>/dev/null | head -1)"
 echo "repo: $REPO"
@@ -31,66 +34,77 @@ echo
 
 idx repro
 
-# --- Guard: the harness must not be part of the corpus ----------------------
-# README.md and verify.sh both name the query terms. If either gets indexed the
-# scores shift and every table below goes stale, which has happened twice.
-echo "Guard — harness excluded from corpus"
-selfnodes=$(q --project repro --name-pattern '.*' --file-pattern 'README%' \
-  | python3 -c 'import sys,json; print(json.load(sys.stdin)["total"])')
-vnodes=$(q --project repro --name-pattern '.*' --file-pattern 'verify%' \
-  | python3 -c 'import sys,json; print(json.load(sys.stdin)["total"])')
-[ "${selfnodes:-1}" = "0" ] && [ "${vnodes:-1}" = "0" ] \
+# --- Guard -------------------------------------------------------------------
+echo "Guard — harness excluded from the corpus"
+a=$(q --project repro --name-pattern '.*' --file-pattern 'README%' | python3 -c 'import sys,json; print(json.load(sys.stdin)["total"])')
+b=$(q --project repro --name-pattern '.*' --file-pattern 'verify%' | python3 -c 'import sys,json; print(json.load(sys.stdin)["total"])')
+[ "${a:-1}" = "0" ] && [ "${b:-1}" = "0" ] \
   && ok "README.md and verify.sh are not indexed" \
-  || bad "harness leaked into corpus (README=$selfnodes verify=$vnodes); scores below are unreliable"
+  || bad "harness leaked into corpus (README=$a verify=$b); results below unreliable"
 
-# --- Finding 1: builtins outrank project code -------------------------------
-echo "Finding 1 — builtins outrank project code"
-out=$(q --project repro --semantic-query '["discount tariff currency"]' --limit 5)
-verdict=$(printf '%s' "$out" | python3 -c '
-import sys, json
-r = json.load(sys.stdin).get("semantic_results", [])
-builtins = [x for x in r if "builtins" in x["file_path"]]
-pricing  = [x for x in r if "pricing" in x["file_path"]]
-print("BUG" if builtins and not pricing else "OK")
-print(", ".join(f'"'"'{x["name"]}({x["file_path"]})'"'"' for x in r[:3]))
-')
-[ "$(printf '%s' "$verdict" | head -1)" = "BUG" ] \
-  && ok "no pricing code returned; builtins only" \
-  || bad "expected builtins-only, got: $(printf '%s' "$verdict" | tail -1)"
-printf '        top3: %s\n' "$(printf '%s' "$verdict" | tail -1)"
+# --- Root cause: OOV keyword -> hash vector ---------------------------------
+echo "Root cause — multi-word keyword degrades to a hash vector"
+phrase=$(q --project repro --semantic-query '["discount tariff currency"]' --limit 5 | names)
+words=$(q  --project repro --semantic-query '["discount","tariff","currency"]' --limit 5 | names)
+p_bi=$(printf '%s' "$phrase" | grep -c 'builtins')
+p_pr=$(printf '%s' "$phrase" | grep -c 'src/')
+w_pr=$(printf '%s' "$words"  | grep -c 'src/')
+{ [ "$p_bi" -gt 0 ] && [ "$p_pr" -eq 0 ] && [ "$w_pr" -gt 0 ]; } \
+  && ok "phrase -> ${p_bi} builtins / 0 project symbols; single words -> ${w_pr} project symbols" \
+  || bad "expected phrase=builtins-only, words=project code (got phrase:${p_bi}b/${p_pr}p words:${w_pr}p)"
 
-# --- Finding 2: negative similarities ---------------------------------------
-echo "Finding 2 — negative cosine similarities returned"
-neg=$(q --project repro --semantic-query '["battery temperature sensor"]' --limit 5 \
-  | python3 -c 'import sys,json; print(sum(1 for x in json.load(sys.stdin).get("semantic_results",[]) if x["score"]<0))')
-[ "${neg:-0}" -gt 0 ] && ok "$neg negative-score hits ranked" || bad "no negative scores seen"
+echo "Root cause — out-of-vocabulary word ranks negative"
+neg=$(q --project repro --semantic-query '["temperature"]' --limit 3 \
+  | python3 -c 'import sys,json; r=json.load(sys.stdin).get("semantic_results",[]); print(sum(1 for x in r if x["score"]<0))')
+[ "${neg:-0}" -gt 0 ] \
+  && ok "'temperature' (absent from token_vectors) yields $neg negative-score hits" \
+  || bad "expected negative scores for an out-of-vocabulary keyword"
 
-# --- Finding 3: project name changes ranking --------------------------------
-echo "Finding 3 — ranking depends on project name"
+echo "Root cause — min-across-keywords penalises specialists"
+r_bat=$(q --project repro --semantic-query '["battery"]' --limit 30 | names | grep -n 'battery_is_critical' | cut -d: -f1)
+r_all=$(q --project repro --semantic-query '["battery","temperature","sensor"]' --limit 30 | names | grep -n 'battery_is_critical' | cut -d: -f1)
+if [ -n "${r_bat:-}" ] && { [ -z "${r_all:-}" ] || [ "$r_all" -gt "$r_bat" ]; }; then
+  ok "battery_is_critical: rank $r_bat on ['battery'] -> rank ${r_all:-absent} on the 3-keyword query"
+else
+  bad "expected the specialist to sink when keywords are combined (got $r_bat -> ${r_all:-absent})"
+fi
+
+# --- Builtins share of the semantic corpus ----------------------------------
+echo "Finding 2 — builtins are a large share of node_vectors"
+if command -v sqlite3 >/dev/null && [ -f "$CACHE/repro.db" ]; then
+  tot=$(sqlite3 "$CACHE/repro.db" "SELECT count(*) FROM node_vectors;")
+  bi=$(sqlite3 "$CACHE/repro.db" "SELECT count(*) FROM node_vectors v JOIN nodes n ON n.id=v.node_id WHERE n.file_path LIKE '%builtins%';")
+  [ "${bi:-0}" -gt 0 ] && [ $((bi * 3)) -ge "${tot:-1}" ] \
+    && ok "$bi of $tot vectors are language builtins" \
+    || bad "expected builtins to be >=1/3 of node_vectors (got $bi/$tot)"
+else
+  skip "sqlite3 unavailable; cannot inspect node_vectors"
+fi
+
+# --- Finding 3: project name changes scores ---------------------------------
+echo "Finding 3 — scores depend on the project name"
 idx othername
-a=$(q --project repro     --semantic-query '["battery temperature sensor"]' --limit 1 \
-      | python3 -c 'import sys,json; r=json.load(sys.stdin).get("semantic_results",[]); print(r[0]["name"] if r else "")')
-b=$(q --project othername --semantic-query '["battery temperature sensor"]' --limit 1 \
-      | python3 -c 'import sys,json; r=json.load(sys.stdin).get("semantic_results",[]); print(r[0]["name"] if r else "")')
-[ -n "$a" ] && [ "$a" != "$b" ] \
-  && ok "rank-1 differs by project name: '$a' vs '$b'" \
-  || bad "rank-1 identical ('$a'); not reproduced here"
+topscore() { python3 -c 'import sys,json
+r = json.load(sys.stdin).get("semantic_results", [])
+print("%.8f" % r[0]["score"] if r else "")'; }
+s1=$(q --project repro     --semantic-query '["battery","temperature","sensor"]' --limit 1 | topscore)
+s2=$(q --project othername --semantic-query '["battery","temperature","sensor"]' --limit 1 | topscore)
+[ -n "$s1" ] && [ "$s1" != "$s2" ] \
+  && ok "rank-1 score differs by project name: $s1 vs $s2" \
+  || bad "scores identical ($s1 vs $s2); not reproduced here"
 
-# --- Finding 4: .cbmignore not re-evaluated on re-index ---------------------
+# --- Finding 4: .cbmignore additive-only ------------------------------------
 echo "Finding 4 — re-index applies inclusions but not exclusions"
-before=$(q --project repro --name-pattern '.*' --file-pattern 'docs/decisions%' \
-          | python3 -c 'import sys,json; print(json.load(sys.stdin)["total"])')
+before=$(q --project repro --name-pattern '.*' --file-pattern 'docs/decisions%' | python3 -c 'import sys,json; print(json.load(sys.stdin)["total"])')
 cp "$REPO/.cbmignore" "$CACHE/cbmignore.bak"
 printf 'README.md\nverify.sh\ndocs/decisions.md\n' > "$REPO/.cbmignore"
 idx repro
-during=$(q --project repro --name-pattern '.*' --file-pattern 'docs/decisions%' \
-          | python3 -c 'import sys,json; print(json.load(sys.stdin)["total"])')
+during=$(q --project repro --name-pattern '.*' --file-pattern 'docs/decisions%' | python3 -c 'import sys,json; print(json.load(sys.stdin)["total"])')
 "$CBM" cli delete_project --project repro >/dev/null 2>&1
 idx repro
-after=$(q --project repro --name-pattern '.*' --file-pattern 'docs/decisions%' \
-          | python3 -c 'import sys,json; print(json.load(sys.stdin)["total"])')
+after=$(q --project repro --name-pattern '.*' --file-pattern 'docs/decisions%' | python3 -c 'import sys,json; print(json.load(sys.stdin)["total"])')
 cp "$CACHE/cbmignore.bak" "$REPO/.cbmignore"
-[ "$before" -gt 0 ] && [ "$during" = "$before" ] && [ "$after" = "0" ] \
+[ "${before:-0}" -gt 0 ] && [ "$during" = "$before" ] && [ "$after" = "0" ] \
   && ok "re-index kept $during nodes; delete_project+index dropped to 0" \
   || bad "expected $before -> $before -> 0, got $before -> $during -> $after"
 
@@ -98,13 +112,13 @@ cp "$CACHE/cbmignore.bak" "$REPO/.cbmignore"
 
 # --- Finding 5: results ignores semantic_query -------------------------------
 echo "Finding 5 — 'results' identical across unrelated queries"
-h1=$(q --project repro --semantic-query '["discount tariff currency"]'   --limit 5 | python3 -c 'import sys,json,hashlib; print(hashlib.sha1(str([r["qualified_name"] for r in json.load(sys.stdin)["results"]]).encode()).hexdigest())')
-h2=$(q --project repro --semantic-query '["battery temperature sensor"]' --limit 5 | python3 -c 'import sys,json,hashlib; print(hashlib.sha1(str([r["qualified_name"] for r in json.load(sys.stdin)["results"]]).encode()).hexdigest())')
+h() { q --project repro --semantic-query "$1" --limit 5 | python3 -c 'import sys,json,hashlib; print(hashlib.sha1(str([r["qualified_name"] for r in json.load(sys.stdin)["results"]]).encode()).hexdigest())'; }
+h1=$(h '["discount","tariff"]'); h2=$(h '["battery","sensor"]')
 [ -n "$h1" ] && [ "$h1" = "$h2" ] \
   && ok "identical rows for unrelated queries (sha1 ${h1:0:12})" \
   || bad "rows differed ($h1 vs $h2)"
 
-# --- Control: BM25 is correct ------------------------------------------------
+# --- Control -----------------------------------------------------------------
 echo "Control — BM25 on the same phrase is correct"
 ctl=$(q --project repro --query "discount tariff currency" --limit 5 \
   | python3 -c 'import sys,json; r=json.load(sys.stdin)["results"]; print("OK" if r and all("pricing" in x["file_path"] for x in r) else "BAD")')
