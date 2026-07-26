@@ -13,7 +13,29 @@ Markdown (produce `Variable` / `Section` nodes that appear to get none).
 and would otherwise contaminate the corpus under test.
 
 Every number below was re-verified from a clean `git clone` into an unrelated
-directory, after `delete_project`.
+directory, after `delete_project`, and again with a virgin `CBM_CACHE_DIR` —
+identical to the digit each time, so nothing here depends on prior local state.
+
+### What is being claimed, and how strongly
+
+The **claims are the orderings**, not the decimals: builtins ranking above
+project code, negative similarities appearing at all, and rank changing with the
+project name. Exact scores are quoted so you can tell whether you are seeing the
+same state, but they were only produced on **macOS 15 / arm64 / v0.9.0**. If your
+digits differ but `<python-builtins>` still outranks `src/pricing.py`, that is
+the bug, not a failed reproduction.
+
+Two scope limits worth knowing before you spend time:
+
+- **Finding 1 may be Python-specific.** `<python-builtins>` nodes come from the
+  Python resolver. A TypeScript or Go corpus may show no builtin pollution.
+- **This install ships no embedding model** — no ONNX, tokenizer, or vocab
+  assets anywhere under the install or cache directories. Together with the
+  project-name sensitivity in Finding 3, that suggests vectors derived from
+  identifier text per project rather than a pretrained code embedding. If
+  `semantic_query` is intended to be lexical rather than neural, then Findings
+  1–3 are a documentation and expectations problem rather than a ranking bug,
+  and a maintainer ruling on that would settle it quickly.
 
 ## Reproduce
 
@@ -193,3 +215,14 @@ root cause; it needs its own reproduction.
 - `codebase-memory-mcp` 0.9.0
 - macOS 15 (Darwin 25.5.0), arm64
 - Index mode: `full`
+
+## One-command check
+
+```bash
+./verify.sh                              # codebase-memory-mcp from PATH
+CBM=/path/to/codebase-memory-mcp ./verify.sh
+```
+
+Asserts the orderings above, not the decimals, and runs against a throwaway
+`CBM_CACHE_DIR` so your own indexes are untouched. Exit code 0 means every
+finding reproduced on your machine.
