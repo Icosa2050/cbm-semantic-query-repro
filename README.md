@@ -1,245 +1,160 @@
-# `semantic_query`: out-of-vocabulary keywords silently become random hash vectors
+# `semantic_query`: out-of-vocabulary keywords fall back to a content-free hash
 
-Reproduction and source-level root cause for
-[DeusData/codebase-memory-mcp#915](https://github.com/DeusData/codebase-memory-mcp/issues/915),
-on **v0.9.0**. Line references are against the `v0.9.0` tag.
+Reproduction, source-level cause, and a validated one-line fix for behaviour
+discussed in [DeusData/codebase-memory-mcp#915](https://github.com/DeusData/codebase-memory-mcp/issues/915).
+Tested on **v0.9.0**; line references are against the `v0.9.0` tag.
 
 Synthetic throwaway code: a parcel delivery service with three deliberately
 unrelated domains — pricing, telemetry, routing — so every query has one
 obviously correct answer. 84 indexed nodes.
 
-`.cbmignore` excludes `README.md` and `verify.sh`; both name the query terms and
-would otherwise contaminate the corpus under test.
-
-Verified identical on **macOS 15 arm64** and **Linux 7.0 x86_64**, both v0.9.0,
-from clean clones with a virgin `CBM_CACHE_DIR`. `./verify.sh` returns 0 on both.
+> **Use the JSON argument form.** `cli search_graph --semantic-query '["x"]'`
+> does **not** parse the array (see Bug A); it passes the literal text `["x"]`
+> as a single keyword. Every example here uses the JSON form.
 
 ---
 
-## Root cause: index-time and query-time vectors come from different spaces
-
-**Index time** — `cbm_sem_random_index()` (`src/semantic/semantic.c:437`) looks
-each token up in the vendored 31 MB `nomic-embed-code` table
-(`vendored/nomic/code_vectors.bin`) and only falls back to sparse random
-indexing on a miss. Node vectors therefore carry real pretrained semantics.
-
-**Query time** — `vs_build_keyword_vectors()` (`src/store/store.c:6245`) does
-*not* call that function. It tries `vs_load_enriched_vector()`
-(`src/store/store.c:6176`), which reads only the per-project `token_vectors`
-table:
-
-```c
-const char *tv_sql = "SELECT vector, idf FROM token_vectors"
-                     " WHERE project = ?1 AND token = ?2 LIMIT 1";
-```
-
-and on a miss falls through to `vs_fill_sparse_random()`
-(`src/store/store.c:6202`):
-
-```c
-static void vs_fill_sparse_random(const char *token, float *out) {
-    uint64_t seed = XXH3_64bits(token, strlen(token));
-    ...
-}
-```
-
-**`vs_fill_sparse_random` never consults the nomic table.** So any keyword
-outside the project's harvested vocabulary is turned into a content-free hash
-and compared against node vectors that were built from pretrained embeddings.
-The result is not a weak match — it is noise, returned silently, with no error
-and no signal to the caller.
-
-`token_vectors` is populated only from the indexed corpus
-(`phase3c_export_token_vectors`, `src/pipeline/pass_semantic_edges.c:1101`). In
-this 84-node repo it holds 108 tokens, all harvested from identifiers.
-
-### Three consequences
-
-**a) Multi-word keywords always miss.** The lookup is on the whole string, and
-the table holds single tokens, so a phrase can never match:
-
-```bash
-codebase-memory-mcp cli search_graph --project repro --semantic-query '["discount tariff currency"]' --limit 4
-#   0.093  print   <python-builtins>
-#   0.079  pop     <python-builtins>     <- pure hash noise
-codebase-memory-mcp cli search_graph --project repro --semantic-query '["discount","tariff","currency"]' --limit 4
-#   0.039  haversine_distance_km  src/routing.py
-#   0.009  summarize_sensor_alarms src/telemetry.py   <- real code
-```
-
-The docs do say keywords, e.g. `["send","pubsub","publish"]`. But a phrase is
-accepted and silently answered with noise rather than rejected.
-
-**b) Ordinary English words miss too, if absent from the identifiers.**
-`temperature` is not in this project's vocabulary — the field is
-`cabin_temperature_c`, tokenized differently — so it degrades to a hash vector:
+## Bug A — the CLI `--semantic-query` flag never parses its array
 
 ```bash
 codebase-memory-mcp cli search_graph --project repro --semantic-query '["temperature"]' --limit 3
-#  -0.00297  tyre_pressure_low
-#  -0.01184  split_into_legs
-#  -0.01191  refrigeration_breached     <- the actual temperature function, ranked 3rd, negative
+#   keyword actually looked up: ["temperature"]      <- the literal string
+
+codebase-memory-mcp cli search_graph '{"project":"repro","semantic_query":["temperature"],"limit":3}'
+#   keyword actually looked up: temperature          <- correct
 ```
 
-`battery` *is* in the vocabulary, yet still ranks `shortest_route` above
-`battery_is_critical`. So vocabulary presence is necessary, not sufficient.
+The flag form yields a keyword that can never be in any vocabulary, so it always
+takes the Bug B fallback and returns noise. The JSON form and piped stdin both
+parse correctly, as does the MCP tool. CLI-only, but silent.
 
-**c) Negative cosines are returned as top hits.** `vs_min_cosine_score()`
-(`src/store/store.c:6267`) takes the minimum across keywords with no floor:
+## Bug B — query-time vectors never consult the pretrained table
+
+At index time, `cbm_sem_random_index()` (`src/semantic/semantic.c:437`) looks a
+token up in the vendored `nomic-embed-code` table (40,856 tokens) and only falls
+back to sparse random indexing on a miss.
+
+At query time, `vs_build_keyword_vectors()` (`src/store/store.c:6245`) does not
+use that function. It tries `vs_load_enriched_vector()` (`src/store/store.c:6176`),
+which reads only the per-project `token_vectors` table, then falls through to
+`vs_fill_sparse_random()` (`src/store/store.c:6202`) — a plain XXH3 hash with no
+nomic lookup.
+
+`token_vectors` holds only tokens harvested from the indexed identifiers (108
+here). `temperature` is absent — the field is `cabin_temperature_c` — even
+though it *is* in the nomic vocabulary at index 35753. So it degrades to a hash.
+
+**One out-of-vocabulary keyword collapses an entire query.** Because
+`vs_min_cosine_score()` (`src/store/store.c:6267`) takes the minimum across
+keywords, the hash keyword dominates:
+
+| query | top 3 |
+| --- | --- |
+| `["battery"]` | `battery_is_critical` +0.946, `summarize_sensor_alarms` +0.934, `refrigeration_breached` +0.904 |
+| `["battery","temperature","sensor"]` | `haversine_distance_km` **+0.069**, `compute_parcel_price` +0.051, `compute_bulk_discount` +0.045 |
+
+Adding `temperature` drops the score by an order of magnitude and flips the
+answer from telemetry to routing.
+
+### Fix (validated)
 
 ```c
-if (cos_k < min_score) { min_score = cos_k; }
+static void vs_fill_sparse_random(const char *token, float *out) {
+    cbm_sem_vec_t sv;
+    cbm_sem_random_index(token, &sv);   /* nomic first, sparse RI on miss */
+    for (int d = 0; d < VS_VEC_DIM && d < CBM_SEM_DIM; d++) {
+        out[d] = sv.v[d];
+    }
+}
 ```
 
-Nothing rejects a negative result. Taking the *min* also systematically
-penalises specialists: `battery_is_critical` is rank 3 on `battery` (+0.033) but
-rank 10 on `temperature` (-0.024), so its min sinks it below a generalist that
-is mediocre on all three.
+plus `#include "semantic/semantic.h"`. `VS_VEC_DIM == CBM_SEM_DIM == 768`.
 
----
+| query | stock | patched |
+| --- | --- | --- |
+| `["temperature"]` | `haversine_distance_km` +0.069 (routing) | `tyre_pressure_low` **+0.396**, `refrigeration_breached` +0.337, `summarize_sensor_alarms` +0.331 (telemetry) |
+| `["battery","temperature","sensor"]` | `haversine_distance_km` +0.069 | `tyre_pressure_low` **+0.396**, `refrigeration_breached` +0.337 |
+| `["battery"]` | `battery_is_critical` +0.946 | unchanged (no fallback taken) |
 
-## Finding 2 — the semantic corpus is 39% language builtins
+`make -f Makefile.cbm test`: **5934 passed, 1 skipped** — byte-identical to the
+unpatched baseline on the same machine. The skip is a network-gated incremental
+test, unrelated.
 
-`cbm_store_vector_search` restricts candidates (`src/store/store.c:6345`):
+## Bug E — `limit` changes the winner, not just the row count
 
-```sql
-AND n.label IN ('Function','Method','Class')
-```
+`fetch_limit = limit * 5` (`src/store/store.c:6357`) and the SQL pre-filter
+orders by the **first keyword only**, then re-ranks by min across keywords. A
+small pool therefore never sees the true best-by-min candidate:
 
-In this repo that is **18 rows total**, of which **7 are Python builtins**:
-
-| source | vectors |
+| limit | top-1 for `["battery","temperature","sensor"]` |
 | --- | --- |
-| `<python-builtins>` (`len` `print` `upper` `lower` `append` `pop` `get`) | **7** |
-| `src/telemetry.py` | 4 |
-| `src/pricing.py` | 4 |
-| `src/routing.py` | 3 |
+| 1 | `summarize_sensor_alarms` +0.0267 |
+| 2 | `compute_parcel_price` +0.0506 |
+| 3+ | `haversine_distance_km` +0.0690 |
 
-Interpreter stubs are 39% of the entire vector space and compete directly with
-project code. Combined with a hash-vector query they win outright.
+Asking for fewer results returns a different and lower-scored winner, so `limit`
+is not a pure truncation.
 
-```bash
-sqlite3 "$CBM_CACHE_DIR/repro.db" \
-  "SELECT n.file_path, count(*) FROM node_vectors v
-     JOIN nodes n ON n.id=v.node_id GROUP BY 1 ORDER BY 2 DESC;"
-```
+## Bug C — scores depend on the project name
 
----
-
-## Finding 3 — scores depend on the project name
-
-The project name is tokenised into the vocabulary along with everything else —
-`repro` is present as a token in `token_vectors` — so it shifts IDF for the
-whole corpus. Same clone, same commit, byte-identical source, only `--name`
+The project name is tokenised into the vocabulary like any other token, so it
+shifts IDF corpus-wide. Same commit, byte-identical source, only `--name`
 differs:
 
-| rank | `--name repro` | `--name othername` |
-| --- | --- | --- |
-| 1 | `haversine_distance_km` 0.05703263 | `haversine_distance_km` 0.05976143 |
-| 2 | `compute_parcel_price` 0.03571049 | `compute_parcel_price` 0.04475240 |
+| project | rank 1 |
+| --- | --- |
+| `repro` | `battery_is_critical` 0.94567562 |
+| `othername` | `battery_is_critical` 0.94138202 |
+
+Small, but an arbitrary label should not move similarity between code symbols.
+
+## Bug D — re-index applies `.cbmignore` inclusions but not exclusions
+
+Unrelated to `semantic_query`. Keep `README.md` and `verify.sh` listed or you
+change two variables at once.
 
 ```bash
-sqlite3 "$CBM_CACHE_DIR/repro.db" "SELECT token FROM token_vectors WHERE token='repro';"
-# repro
-```
-
-IDF is computed over the same 18 documents (stored ×1000: `2197` = ln(18/2),
-`2890` = ln(18/1), `1504` = ln(18/4)), so a corpus this small is highly
-sensitive to any token added — including the project label.
-
----
-
-## Finding 4 — re-index applies `.cbmignore` inclusions but not exclusions
-
-Unrelated to `semantic_query`; found while building this repro. Keep `README.md`
-and `verify.sh` listed or you change two variables at once.
-
-```bash
-codebase-memory-mcp cli search_graph --project repro --name-pattern '.*' --file-pattern 'docs/decisions%'
-# -> total: 6
-
 printf 'README.md\nverify.sh\ndocs/decisions.md\n' > .cbmignore
-codebase-memory-mcp cli index_repository --repo-path "$PWD" --name repro --mode full   # -> nodes: 84 (unchanged)
-codebase-memory-mcp cli search_graph --project repro --name-pattern '.*' --file-pattern 'docs/decisions%'
-# -> total: 6    (still indexed; the new rule had no effect)
-
+codebase-memory-mcp cli index_repository --repo-path "$PWD" --name repro --mode full  # nodes: 84, unchanged
+# docs/decisions.md still indexed (6 nodes)
 codebase-memory-mcp cli delete_project --project repro
-codebase-memory-mcp cli index_repository --repo-path "$PWD" --name repro --mode full   # -> nodes: 78
-# -> total: 0
+codebase-memory-mcp cli index_repository --repo-path "$PWD" --name repro --mode full  # nodes: 78 -> 0
 ```
 
-The update is additive-only: removing `verify.sh` from the ignore list and
-re-indexing takes the graph 84 -> 101 immediately, while a newly *added*
-exclusion is ignored in the same run. `delete_project` is currently required
-for any exclusion to take effect.
+Additive-only: *removing* a name from `.cbmignore` is picked up immediately
+(84 -> 101), *adding* one is not. `delete_project` is currently required.
 
----
+## Observation — `results` ignores `semantic_query` (probably by design)
 
-## Finding 5 — `results` ignores `semantic_query` (probably by design)
+Three unrelated queries return byte-identical `results`, alphabetical by `name`,
+`total` equal to the full node count. Per `cli search_graph --help`, semantic
+output goes to `semantic_results` and `results` is the structural-filter field,
+so with no `query`/`name_pattern`/`label` there is nothing to filter it by.
 
-This is what #915 reports. With `semantic_query` as the only argument, `results`
-is byte-identical for every query, alphabetical by `name`, `total` equal to the
-full node count — verified by hashing rows from unrelated queries.
+**#915's `LEFT JOIN node_vectors` diagnosis does not fit**: the vector path
+already uses an inner join (`src/store/store.c:6341`). But `total: 84` beside a
+populated `results` array reads as "84 matches", which is probably how that
+reading arose.
 
-```json
-{ "total": 84,
-  "results": [
-    { "name": "\"Deferred Until\" Conditions", "label": "Section",  "file_path": "docs/decisions.md" },
-    { "name": "$defs", "label": "Variable", "file_path": "schemas/parcel.schema.json" },
-    { "name": "$id",   "label": "Variable", "file_path": "schemas/parcel.schema.json" }
-  ] }
-```
+## Retracted
 
-**#915's proposed fix does not apply here.** The vector path already uses an
-inner join (`src/store/store.c:6341`):
+An earlier version of this repo claimed language builtins outrank project code.
+**That was wrong** — an artifact of Bug A. With correct parsing,
+`["discount","tariff","currency"]` returns all four `src/pricing.py` functions
+(+0.781, +0.778, +0.732, +0.705) and no builtins. Builtins *are* 7 of 18 rows in
+`node_vectors`, but they do not distort correctly-parsed queries.
 
-```sql
-FROM node_vectors v INNER JOIN nodes n ON n.id = v.node_id
-```
-
-Semantic output goes to `semantic_results`; `results` is the structural-filter
-field, and with no `query`/`name_pattern`/`label` supplied there is nothing to
-filter it by. That is defensible, but `total: 84` beside a populated `results`
-array reads as "84 matches", which is what led to the `LEFT JOIN` diagnosis.
-
----
-
-## Control — the index is sound
-
-```bash
-codebase-memory-mcp cli search_graph --project repro --query "discount tariff currency" --limit 5
-# total: 3 -> compute_bulk_discount, apply_currency_surcharge, Tariff   (all src/pricing.py)
-```
-
-BM25 and `name_pattern` are exactly right. The defect is confined to
-`semantic_query`.
-
----
-
-## Suggested fixes
-
-1. Have `vs_fill_sparse_random` fall back to the pretrained nomic table, as
-   `cbm_sem_random_index` already does — or share one code path. This is the
-   root cause; the rest are amplifiers.
-2. Tokenise multi-word keywords instead of looking them up verbatim, or reject
-   them with an explicit error.
-3. Exclude `<python-builtins>` and equivalent stub nodes from `node_vectors`.
-4. Add a score floor in `vs_min_cosine_score`, and reconsider min-across-keywords,
-   which penalises specialists.
-5. Exclude the project name from the tokenised corpus.
-6. Signal out-of-vocabulary keywords in the response rather than returning noise.
-
-## One-command check
+## Verify
 
 ```bash
 ./verify.sh
 CBM=/path/to/codebase-memory-mcp ./verify.sh
 ```
 
-Asserts the behaviours above, not exact decimals, against a throwaway
-`CBM_CACHE_DIR`. Exit 0 means everything reproduced.
+Uses the JSON form throughout and a throwaway `CBM_CACHE_DIR`. Exit 0 means
+everything reproduced.
 
 ## Environment
 
 - `codebase-memory-mcp` 0.9.0, index mode `full`
-- Verified on macOS 15 (Darwin 25.5.0) arm64 **and** Linux 7.0.0 x86_64
+- Verified on macOS 15 (Darwin 25.5.0) arm64 and Linux 7.0.0 x86_64
